@@ -27,7 +27,8 @@ const (
 )
 
 const (
-	stateBrowser screenState = iota
+	stateSplash screenState = iota
+	stateBrowser
 	stateReading
 	stateAddingFeed
 	stateConfirmDelete
@@ -101,6 +102,8 @@ type deleteArticleFinishedMsg struct {
 	err    error
 }
 
+type splashDoneMsg struct{}
+
 type model struct {
 	ctx          context.Context
 	repo         *storage.Repository
@@ -152,9 +155,9 @@ func NewModel(ctx context.Context, repo *storage.Repository, service *rss.Servic
 		ctx:         ctx,
 		repo:        repo,
 		service:     service,
-		state:       stateBrowser,
+		state:       stateSplash,
 		focus:       focusFeeds,
-		status:      "Loading feeds...",
+		status:      "Booting...",
 		feedList:    feedList,
 		articleList: articleList,
 		input:       input,
@@ -163,7 +166,9 @@ func NewModel(ctx context.Context, repo *storage.Repository, service *rss.Servic
 }
 
 func (m model) Init() tea.Cmd {
-	return m.loadFeedsCmd()
+	return tea.Tick(1400*time.Millisecond, func(time.Time) tea.Msg {
+		return splashDoneMsg{}
+	})
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -174,6 +179,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ready = true
 		m.resize()
 		return m, nil
+	case splashDoneMsg:
+		m.state = stateBrowser
+		m.setStatus("Loading feeds...")
+		return m, m.loadFeedsCmd()
 	case feedsLoadedMsg:
 		if msg.err != nil {
 			m.setError(msg.err)
@@ -281,6 +290,8 @@ func (m model) View() string {
 	}
 
 	switch m.state {
+	case stateSplash:
+		return m.splashView()
 	case stateReading:
 		return m.readingView()
 	case stateAddingFeed:
@@ -305,6 +316,12 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch m.state {
+	case stateSplash:
+		switch msg.String() {
+		case "q", "ctrl+c":
+			return m, tea.Quit
+		}
+		return m, nil
 	case stateReading:
 		switch msg.String() {
 		case "esc":
@@ -439,6 +456,31 @@ func (m model) browserView() string {
 
 	help := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("Tab switch • Enter open • a add • d delete selected • r sync • q quit")
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, status, help)
+}
+
+func (m model) splashView() string {
+	logo := `
+██████╗ ███████╗███████╗      ██████╗██╗     ██╗
+██╔══██╗██╔════╝██╔════╝     ██╔════╝██║     ██║
+██████╔╝███████╗███████╗     ██║     ██║     ██║
+██╔══██╗╚════██║╚════██║     ██║     ██║     ██║
+██║  ██║███████║███████║     ╚██████╗███████╗██║
+╚═╝  ╚═╝╚══════╝╚══════╝      ╚═════╝╚══════╝╚═╝
+`
+
+	title := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("45")).
+		Bold(true).
+		Render(logo)
+	tagline := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("250")).
+		Render("Terminal RSS reader")
+	loading := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("244")).
+		Render("Loading...")
+
+	block := lipgloss.JoinVertical(lipgloss.Center, title, tagline, "", loading)
+	return lipgloss.Place(m.width, max(12, m.height), lipgloss.Center, lipgloss.Center, block)
 }
 
 func (m model) readingView() string {

@@ -4,9 +4,13 @@ import (
 	"context"
 	"fmt"
 	"html"
+	"net/http"
+	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
+	"github.com/PuerkitoBio/goquery"
 	"github.com/danterobles/rss-cli/internal/storage"
 	"github.com/mmcdole/gofeed"
 )
@@ -14,12 +18,14 @@ import (
 type Service struct {
 	parser *gofeed.Parser
 	repo   *storage.Repository
+	client *http.Client
 }
 
 func NewService(repo *storage.Repository) *Service {
 	return &Service{
 		parser: gofeed.NewParser(),
 		repo:   repo,
+		client: &http.Client{Timeout: 15 * time.Second},
 	}
 }
 
@@ -101,12 +107,13 @@ func (s *Service) storeItems(ctx context.Context, feedID int64, items []*gofeed.
 			FeedID:      feedID,
 			Title:       strings.TrimSpace(item.Title),
 			Link:        strings.TrimSpace(item.Link),
-			Content:     extractContent(item),
 			PublishedAt: publishedAt(item),
 		}
 		if article.Title == "" {
 			article.Title = article.Link
 		}
+		article.Content = s.resolveArticleContent(ctx, article.Title, article.Link, extractContent(item))
+
 		created, err := s.repo.UpsertArticle(ctx, article)
 		if err != nil {
 			return inserted, err
@@ -116,6 +123,188 @@ func (s *Service) storeItems(ctx context.Context, feedID int64, items []*gofeed.
 		}
 	}
 	return inserted, nil
+}
+
+var whitespaceRE = regexp.MustCompile(`\s+`)
+
+func (s *Service) resolveArticleContent(ctx context.Context, title, link, fallback string) string {
+	content, err := s.fetchArticleContent(ctx, link)
+	if err == nil && strings.TrimSpace(content) != "" {
+		return content
+	}
+
+	fallback = strings.TrimSpace(fallback)
+	if fallback != "" {
+		return fallback
+	}
+	return fmt.Sprintf("# %s\n\n[%s](%s)", title, link, link)
+}
+
+func (s *Service) fetchArticleContent(ctx context.Context, articleURL string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, articleURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("build article request: %w", err)
+	}
+	req.Header.Set("User-Agent", "rss-cli/0.1 (+https://github.com/danterobles/rss-cli)")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml")
+
+	res, err := s.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("fetch article: %w", err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return "", fmt.Errorf("fetch article status: %s", res.Status)
+	}
+
+	doc, err := goquery.NewDocumentFromReader(res.Body)
+	if err != nil {
+		return "", fmt.Errorf("parse article html: %w", err)
+	}
+
+	removeNoise(doc)
+
+	root := pickReadableRoot(doc)
+	if root.Length() == 0 {
+		root = doc.Find("body").First()
+	}
+	if root.Length() == 0 {
+		return "", fmt.Errorf("article body not found")
+	}
+
+	markdown := extractMarkdown(root, articleURL)
+	if strings.TrimSpace(markdown) == "" {
+		return "", fmt.Errorf("article content empty")
+	}
+	return markdown, nil
+}
+
+func removeNoise(doc *goquery.Document) {
+	doc.Find("script, style, noscript, svg, canvas, iframe, form, header nav, footer, aside, .advertisement, .ads, .ad, .promo, .related, .sidebar, .share, .social").Each(func(_ int, s *goquery.Selection) {
+		s.Remove()
+	})
+}
+
+func pickReadableRoot(doc *goquery.Document) *goquery.Selection {
+	candidates := []string{
+		"article",
+		"[itemprop='articleBody']",
+		".article-content",
+		".article__content",
+		".post-content",
+		".entry-content",
+		".content__article-body",
+		".story-body",
+		".story-content",
+		"main",
+	}
+
+	var best *goquery.Selection
+	bestScore := -1
+	for _, selector := range candidates {
+		doc.Find(selector).Each(func(_ int, s *goquery.Selection) {
+			score := readableScore(s)
+			if score > bestScore {
+				bestScore = score
+				best = s
+			}
+		})
+	}
+
+	if best != nil {
+		return best
+	}
+	return doc.Find("body").First()
+}
+
+func readableScore(s *goquery.Selection) int {
+	text := normalizeSpace(s.Text())
+	if text == "" {
+		return 0
+	}
+	return len(text) + s.Find("p").Length()*120 + s.Find("h1,h2,h3").Length()*80
+}
+
+func extractMarkdown(root *goquery.Selection, articleURL string) string {
+	var blocks []string
+	baseURL, _ := url.Parse(articleURL)
+
+	root.Find("h1, h2, h3, h4, h5, h6, p, li, blockquote, pre").Each(func(_ int, s *goquery.Selection) {
+		tag := goquery.NodeName(s)
+		text := renderNodeText(s, baseURL)
+		if text == "" {
+			return
+		}
+
+		switch tag {
+		case "h1":
+			blocks = append(blocks, "# "+text)
+		case "h2":
+			blocks = append(blocks, "## "+text)
+		case "h3", "h4", "h5", "h6":
+			blocks = append(blocks, "### "+text)
+		case "li":
+			blocks = append(blocks, "- "+text)
+		case "blockquote":
+			blocks = append(blocks, "> "+strings.ReplaceAll(text, "\n", "\n> "))
+		case "pre":
+			blocks = append(blocks, "```text\n"+text+"\n```")
+		default:
+			blocks = append(blocks, text)
+		}
+	})
+
+	return dedupeBlocks(blocks)
+}
+
+func renderNodeText(s *goquery.Selection, baseURL *url.URL) string {
+	clone := s.Clone()
+	clone.Find("script, style, noscript").Remove()
+
+	clone.Find("a").Each(func(_ int, a *goquery.Selection) {
+		text := normalizeSpace(a.Text())
+		href, _ := a.Attr("href")
+		if href != "" && baseURL != nil {
+			if parsed, err := baseURL.Parse(href); err == nil {
+				href = parsed.String()
+			}
+		}
+
+		switch {
+		case text == "" && href != "":
+			a.SetText(href)
+		case text != "" && href != "" && strings.HasPrefix(goquery.NodeName(s), "p"):
+			a.SetText(text + " (" + href + ")")
+		default:
+			a.SetText(text)
+		}
+	})
+
+	return normalizeSpace(clone.Text())
+}
+
+func dedupeBlocks(blocks []string) string {
+	seen := make(map[string]struct{}, len(blocks))
+	filtered := make([]string, 0, len(blocks))
+	for _, block := range blocks {
+		block = strings.TrimSpace(block)
+		if len(block) < 2 {
+			continue
+		}
+		if _, ok := seen[block]; ok {
+			continue
+		}
+		seen[block] = struct{}{}
+		filtered = append(filtered, block)
+	}
+	return strings.Join(filtered, "\n\n")
+}
+
+func normalizeSpace(s string) string {
+	s = html.UnescapeString(s)
+	s = whitespaceRE.ReplaceAllString(strings.TrimSpace(s), " ")
+	return s
 }
 
 func feedTitle(feed *gofeed.Feed) string {
