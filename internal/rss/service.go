@@ -107,10 +107,13 @@ func (s *Service) storeItems(ctx context.Context, feedID int64, items []*gofeed.
 		if article.Title == "" {
 			article.Title = article.Link
 		}
-		if err := s.repo.UpsertArticle(ctx, article); err != nil {
+		created, err := s.repo.UpsertArticle(ctx, article)
+		if err != nil {
 			return inserted, err
 		}
-		inserted++
+		if created {
+			inserted++
+		}
 	}
 	return inserted, nil
 }

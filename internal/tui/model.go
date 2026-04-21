@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -35,6 +36,7 @@ const (
 const (
 	deleteNothing pendingDelete = iota
 	deleteFeed
+	deleteArticle
 )
 
 type feedItem struct {
@@ -94,25 +96,31 @@ type deleteFeedFinishedMsg struct {
 	err error
 }
 
+type deleteArticleFinishedMsg struct {
+	feedID int64
+	err    error
+}
+
 type model struct {
-	ctx         context.Context
-	repo        *storage.Repository
-	service     *rss.Service
-	ready       bool
-	width       int
-	height      int
-	state       screenState
-	focus       focusArea
-	pending     pendingDelete
-	status      string
-	err         error
-	feeds       []storage.Feed
-	articles    []storage.Article
-	feedList    list.Model
-	articleList list.Model
-	viewport    viewport.Model
-	input       textinput.Model
-	renderer    *glamour.TermRenderer
+	ctx          context.Context
+	repo         *storage.Repository
+	service      *rss.Service
+	ready        bool
+	width        int
+	height       int
+	state        screenState
+	focus        focusArea
+	pending      pendingDelete
+	status       string
+	err          error
+	errorMessage string
+	feeds        []storage.Feed
+	articles     []storage.Article
+	feedList     list.Model
+	articleList  list.Model
+	viewport     viewport.Model
+	input        textinput.Model
+	renderer     *glamour.TermRenderer
 }
 
 func NewModel(ctx context.Context, repo *storage.Repository, service *rss.Service) (tea.Model, error) {
@@ -176,7 +184,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(m.feeds) == 0 {
 			m.articles = nil
 			m.articleList.SetItems(nil)
-			m.status = "No feeds yet. Press 'a' to add one."
+			m.setStatus("No feeds yet. Press 'a' to add one.")
 			return m, nil
 		}
 		selected := m.selectedFeed()
@@ -184,7 +192,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.feedList.Select(0)
 			selected = m.selectedFeed()
 		}
-		m.status = fmt.Sprintf("%d feed(s) loaded", len(m.feeds))
+		m.setStatus(fmt.Sprintf("%d feed(s) loaded", len(m.feeds)))
 		return m, m.loadArticlesCmd(selected.ID)
 	case articlesLoadedMsg:
 		if msg.err != nil {
@@ -197,9 +205,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.articles = msg.articles
 		m.setArticleItems()
 		if len(msg.articles) == 0 {
-			m.status = "No articles yet. Press 'r' to sync."
+			m.setStatus("No articles yet. Press 'r' to sync.")
 		} else {
-			m.status = fmt.Sprintf("%d article(s)", len(msg.articles))
+			m.setStatus(fmt.Sprintf("%d article(s)", len(msg.articles)))
 		}
 		return m, nil
 	case articleRenderedMsg:
@@ -210,14 +218,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.SetContent(msg.body)
 		m.viewport.GotoTop()
 		m.state = stateReading
-		m.status = msg.article.Title
+		m.setStatus(msg.article.Title)
 		return m, m.markReadCmd(msg.article.ID)
 	case syncFinishedMsg:
 		if msg.err != nil {
 			m.setError(msg.err)
 			return m, nil
 		}
-		m.status = fmt.Sprintf("Synced %d article(s)", msg.added)
+		m.setStatus(fmt.Sprintf("Synced %d new article(s)", msg.added))
 		return m, tea.Batch(m.loadFeedsCmd(), m.loadArticlesCmd(msg.feedID))
 	case addFeedFinishedMsg:
 		m.state = stateBrowser
@@ -227,7 +235,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.setError(msg.err)
 			return m, nil
 		}
-		m.status = fmt.Sprintf("Feed added with %d article(s)", msg.added)
+		m.setStatus(fmt.Sprintf("Feed added with %d new article(s)", msg.added))
 		return m, m.loadFeedsCmd()
 	case deleteFeedFinishedMsg:
 		m.state = stateBrowser
@@ -236,8 +244,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.setError(msg.err)
 			return m, nil
 		}
-		m.status = "Feed deleted"
+		m.setStatus("Feed deleted")
 		return m, m.loadFeedsCmd()
+	case deleteArticleFinishedMsg:
+		m.state = stateBrowser
+		m.pending = deleteNothing
+		if msg.err != nil {
+			m.setError(msg.err)
+			return m, nil
+		}
+		m.setStatus("Article deleted")
+		return m, m.loadArticlesCmd(msg.feedID)
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
@@ -267,15 +284,26 @@ func (m model) View() string {
 	case stateReading:
 		return m.readingView()
 	case stateAddingFeed:
-		return m.browserView() + "\n" + m.modal("Add feed", m.input.View()+"\n\nEnter to save • Esc to cancel")
+		return m.withOverlay(m.browserView(), m.modal("Add feed", m.input.View()+"\n\nEnter to save • Esc to cancel"))
 	case stateConfirmDelete:
-		return m.browserView() + "\n" + m.modal("Delete feed", "Press y to delete the selected feed or n to cancel.")
+		return m.withOverlay(m.browserView(), m.deleteModal())
 	default:
-		return m.browserView()
+		return m.withOverlay(m.browserView(), m.errorModal())
 	}
 }
 
 func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.errorMessage != "" {
+		switch msg.String() {
+		case "enter", "esc":
+			m.clearError()
+			return m, nil
+		case "q", "ctrl+c":
+			return m, tea.Quit
+		}
+		return m, nil
+	}
+
 	switch m.state {
 	case stateReading:
 		switch msg.String() {
@@ -297,10 +325,10 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "enter":
 			value := strings.TrimSpace(m.input.Value())
 			if value == "" {
-				m.status = "Feed URL is required"
+				m.setStatus("Feed URL is required")
 				return m, nil
 			}
-			m.status = "Adding feed..."
+			m.setStatus("Adding feed...")
 			return m, m.addFeedCmd(value)
 		}
 		var cmd tea.Cmd
@@ -309,11 +337,18 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case stateConfirmDelete:
 		switch msg.String() {
 		case "y":
-			if m.pending == deleteFeed {
+			switch m.pending {
+			case deleteFeed:
 				feed := m.selectedFeed()
 				if feed.ID != 0 {
-					m.status = "Deleting feed..."
+					m.setStatus("Deleting feed...")
 					return m, m.deleteFeedCmd(feed.ID)
+				}
+			case deleteArticle:
+				article := m.selectedArticle()
+				if article.ID != 0 {
+					m.setStatus("Deleting article...")
+					return m, m.deleteArticleCmd(article.ID, article.FeedID)
 				}
 			}
 			m.state = stateBrowser
@@ -340,8 +375,16 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "a":
 		m.state = stateAddingFeed
 		m.input.Focus()
+		m.clearError()
 		return m, nil
 	case "d":
+		if m.focus == focusArticles {
+			if m.selectedArticle().ID != 0 {
+				m.state = stateConfirmDelete
+				m.pending = deleteArticle
+			}
+			return m, nil
+		}
 		if m.selectedFeed().ID != 0 {
 			m.state = stateConfirmDelete
 			m.pending = deleteFeed
@@ -352,7 +395,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if feed.ID == 0 {
 			return m, nil
 		}
-		m.status = "Syncing feed..."
+		m.setStatus("Syncing feed...")
 		return m, m.syncFeedCmd(feed)
 	case "enter":
 		if m.focus == focusFeeds {
@@ -394,7 +437,7 @@ func (m model) browserView() string {
 	right := rightStyle.Render(m.articleList.View())
 	body := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
 
-	help := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("Tab switch • Enter open • a add • d delete • r sync • q quit")
+	help := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("Tab switch • Enter open • a add • d delete selected • r sync • q quit")
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, status, help)
 }
 
@@ -417,6 +460,39 @@ func (m model) modal(title, body string) string {
 		BorderForeground(lipgloss.Color("205")).
 		Padding(1, 2)
 	return style.Render(lipgloss.NewStyle().Bold(true).Render(title) + "\n\n" + body)
+}
+
+func (m model) deleteModal() string {
+	switch m.pending {
+	case deleteArticle:
+		article := m.selectedArticle()
+		title := article.Title
+		if title == "" {
+			title = "selected article"
+		}
+		return m.modal("Delete article", fmt.Sprintf("Delete \"%s\"?\n\nPress y to confirm or n to cancel.", title))
+	default:
+		feed := m.selectedFeed()
+		title := feed.Title
+		if title == "" {
+			title = "selected feed"
+		}
+		return m.modal("Delete feed", fmt.Sprintf("Delete \"%s\" and its stored articles?\n\nPress y to confirm or n to cancel.", title))
+	}
+}
+
+func (m model) errorModal() string {
+	if m.errorMessage == "" {
+		return ""
+	}
+	return m.modal("Error", m.errorMessage+"\n\nPress Esc or Enter to dismiss.")
+}
+
+func (m model) withOverlay(base, overlay string) string {
+	if overlay == "" {
+		return base
+	}
+	return base + "\n" + overlay
 }
 
 func (m *model) resize() {
@@ -467,12 +543,23 @@ func (m model) selectedArticle() storage.Article {
 
 func (m *model) setError(err error) {
 	m.err = err
-	m.status = err.Error()
+	m.errorMessage = friendlyError(err)
+	m.status = "Operation failed"
+}
+
+func (m *model) clearError() {
+	m.err = nil
+	m.errorMessage = ""
+}
+
+func (m *model) setStatus(status string) {
+	m.clearError()
+	m.status = status
 }
 
 func (m model) statusLine() string {
-	if m.err != nil {
-		return "Error: " + m.err.Error()
+	if m.errorMessage != "" {
+		return "Error: " + m.errorMessage
 	}
 	return m.status
 }
@@ -549,6 +636,34 @@ func (m model) deleteFeedCmd(feedID int64) tea.Cmd {
 	return func() tea.Msg {
 		err := m.repo.DeleteFeedByID(m.ctx, feedID)
 		return deleteFeedFinishedMsg{err: err}
+	}
+}
+
+func (m model) deleteArticleCmd(articleID, feedID int64) tea.Cmd {
+	return func() tea.Msg {
+		err := m.repo.DeleteArticleByID(m.ctx, articleID)
+		return deleteArticleFinishedMsg{feedID: feedID, err: err}
+	}
+}
+
+func friendlyError(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, storage.ErrNotFound) {
+		return "The selected item no longer exists."
+	}
+
+	message := err.Error()
+	switch {
+	case strings.Contains(message, "parse feed"):
+		return "Could not parse the feed URL. Verify that it is a valid RSS or Atom source."
+	case strings.Contains(message, "UNIQUE constraint failed: feeds.url"):
+		return "That feed is already registered."
+	case strings.Contains(message, "sync feed"):
+		return "The feed could not be refreshed right now."
+	default:
+		return message
 	}
 }
 

@@ -144,8 +144,13 @@ func (r *Repository) DeleteFeedByID(ctx context.Context, id int64) error {
 	return nil
 }
 
-func (r *Repository) UpsertArticle(ctx context.Context, article Article) error {
-	_, err := r.db.ExecContext(ctx, `
+func (r *Repository) UpsertArticle(ctx context.Context, article Article) (bool, error) {
+	existingID, err := r.articleIDByLink(ctx, article.Link)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return false, err
+	}
+
+	_, err = r.db.ExecContext(ctx, `
 INSERT INTO articles (feed_id, title, link, content, published_at, is_read)
 VALUES (?, ?, ?, ?, ?, 0)
 ON CONFLICT(link) DO UPDATE SET
@@ -154,9 +159,9 @@ ON CONFLICT(link) DO UPDATE SET
 	published_at = excluded.published_at
 `, article.FeedID, article.Title, article.Link, article.Content, nullableTime(article.PublishedAt))
 	if err != nil {
-		return fmt.Errorf("upsert article: %w", err)
+		return false, fmt.Errorf("upsert article: %w", err)
 	}
-	return nil
+	return existingID == 0, nil
 }
 
 func (r *Repository) ListArticlesByFeed(ctx context.Context, feedID int64) ([]Article, error) {
@@ -199,6 +204,34 @@ func (r *Repository) MarkArticleRead(ctx context.Context, id int64) error {
 		return fmt.Errorf("mark article read: %w", err)
 	}
 	return nil
+}
+
+func (r *Repository) DeleteArticleByID(ctx context.Context, id int64) error {
+	res, err := r.db.ExecContext(ctx, `DELETE FROM articles WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete article: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("delete article affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *Repository) articleIDByLink(ctx context.Context, link string) (int64, error) {
+	row := r.db.QueryRowContext(ctx, `SELECT id FROM articles WHERE link = ?`, strings.TrimSpace(link))
+
+	var id int64
+	if err := row.Scan(&id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, ErrNotFound
+		}
+		return 0, fmt.Errorf("lookup article by link: %w", err)
+	}
+	return id, nil
 }
 
 func scanFeed(scanner interface{ Scan(dest ...any) error }) (Feed, error) {
