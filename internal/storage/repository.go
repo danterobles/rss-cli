@@ -221,6 +221,21 @@ func (r *Repository) DeleteArticleByID(ctx context.Context, id int64) error {
 	return nil
 }
 
+func (r *Repository) UpdateArticleContent(ctx context.Context, id int64, content string) error {
+	res, err := r.db.ExecContext(ctx, `UPDATE articles SET content = ? WHERE id = ?`, strings.TrimSpace(content), id)
+	if err != nil {
+		return fmt.Errorf("update article content: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("update article content affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (r *Repository) articleIDByLink(ctx context.Context, link string) (int64, error) {
 	row := r.db.QueryRowContext(ctx, `SELECT id FROM articles WHERE link = ?`, strings.TrimSpace(link))
 

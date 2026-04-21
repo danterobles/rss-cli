@@ -122,6 +122,8 @@ type model struct {
 	feedList     list.Model
 	articleList  list.Model
 	viewport     viewport.Model
+	readLines    []string
+	readOffset   int
 	input        textinput.Model
 	renderer     *glamour.TermRenderer
 }
@@ -224,8 +226,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.setError(msg.err)
 			return m, nil
 		}
-		m.viewport.SetContent(msg.body)
-		m.viewport.GotoTop()
+		m.readLines = strings.Split(strings.ReplaceAll(msg.body, "\r\n", "\n"), "\n")
+		m.readOffset = 0
 		m.state = stateReading
 		m.setStatus(msg.article.Title)
 		return m, m.markReadCmd(msg.article.ID)
@@ -271,7 +273,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	switch m.state {
 	case stateReading:
-		m.viewport, cmd = m.viewport.Update(msg)
+		return m, nil
 	case stateAddingFeed:
 		m.input, cmd = m.input.Update(msg)
 	default:
@@ -329,8 +331,31 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "q", "ctrl+c":
 			return m, tea.Quit
+		case "up", "k":
+			m.scrollReading(-1)
+			return m, nil
+		case "down", "j":
+			m.scrollReading(1)
+			return m, nil
+		case "pgup", "b":
+			m.scrollReading(-m.readPageStep())
+			return m, nil
+		case "pgdown", "f", " ":
+			m.scrollReading(m.readPageStep())
+			return m, nil
+		case "u", "ctrl+u":
+			m.scrollReading(-(m.readPageStep() / 2))
+			return m, nil
+		case "d", "ctrl+d":
+			m.scrollReading(m.readPageStep() / 2)
+			return m, nil
+		case "home", "g":
+			m.readOffset = 0
+			return m, nil
+		case "end", "G":
+			m.readOffset = m.maxReadOffset()
+			return m, nil
 		}
-		m.viewport, _ = m.viewport.Update(msg)
 		return m, nil
 	case stateAddingFeed:
 		switch msg.String() {
@@ -484,14 +509,22 @@ func (m model) splashView() string {
 }
 
 func (m model) readingView() string {
+	contentHeight := m.readContentHeight()
+	start := clamp(m.readOffset, 0, m.maxReadOffset())
+	end := clamp(start+contentHeight, start, len(m.readLines))
+	body := strings.Join(m.readLines[start:end], "\n")
+	if body == "" {
+		body = "No content"
+	}
+
 	frame := lipgloss.NewStyle().
 		Width(m.width).
 		Height(m.height - 2).
 		Border(lipgloss.NormalBorder()).
 		BorderForeground(lipgloss.Color("63")).
-		Render(m.viewport.View())
+		Render(body)
 
-	footer := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("j/k or arrows scroll • Esc back • q quit")
+	footer := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(fmt.Sprintf("j/k or arrows scroll • Esc back • q quit • %d/%d", start+1, max(start+1, len(m.readLines))))
 	return lipgloss.JoinVertical(lipgloss.Left, frame, footer)
 }
 
@@ -633,6 +666,11 @@ func (m model) loadArticlesCmd(feedID int64) tea.Cmd {
 
 func (m model) renderArticleCmd(article storage.Article) tea.Cmd {
 	return func() tea.Msg {
+		hydrated, err := m.service.HydrateArticle(m.ctx, article)
+		if err == nil {
+			article = hydrated
+		}
+
 		body := article.Content
 		if strings.TrimSpace(body) == "" {
 			body = fmt.Sprintf("# %s\n\n[%s](%s)", article.Title, article.Link, article.Link)
@@ -688,6 +726,25 @@ func (m model) deleteArticleCmd(articleID, feedID int64) tea.Cmd {
 	}
 }
 
+func (m *model) scrollReading(delta int) {
+	if delta == 0 {
+		return
+	}
+	m.readOffset = clamp(m.readOffset+delta, 0, m.maxReadOffset())
+}
+
+func (m model) readContentHeight() int {
+	return max(1, m.height-4)
+}
+
+func (m model) readPageStep() int {
+	return max(1, m.readContentHeight())
+}
+
+func (m model) maxReadOffset() int {
+	return max(0, len(m.readLines)-m.readContentHeight())
+}
+
 func friendlyError(err error) string {
 	if err == nil {
 		return ""
@@ -721,4 +778,14 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func clamp(n, low, high int) int {
+	if n < low {
+		return low
+	}
+	if n > high {
+		return high
+	}
+	return n
 }

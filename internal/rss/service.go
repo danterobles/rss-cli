@@ -112,7 +112,7 @@ func (s *Service) storeItems(ctx context.Context, feedID int64, items []*gofeed.
 		if article.Title == "" {
 			article.Title = article.Link
 		}
-		article.Content = s.resolveArticleContent(ctx, article.Title, article.Link, extractContent(item))
+		article.Content = previewContent(article.Title, article.Link, extractContent(item))
 
 		created, err := s.repo.UpsertArticle(ctx, article)
 		if err != nil {
@@ -127,17 +127,44 @@ func (s *Service) storeItems(ctx context.Context, feedID int64, items []*gofeed.
 
 var whitespaceRE = regexp.MustCompile(`\s+`)
 
-func (s *Service) resolveArticleContent(ctx context.Context, title, link, fallback string) string {
-	content, err := s.fetchArticleContent(ctx, link)
-	if err == nil && strings.TrimSpace(content) != "" {
-		return content
+func (s *Service) HydrateArticle(ctx context.Context, article storage.Article) (storage.Article, error) {
+	content := strings.TrimSpace(article.Content)
+	if isFullArticleContent(content) {
+		return article, nil
 	}
 
+	fullContent, err := s.fetchArticleContent(ctx, article.Link)
+	if err != nil {
+		if content != "" {
+			return article, nil
+		}
+		return article, err
+	}
+
+	if err := s.repo.UpdateArticleContent(ctx, article.ID, fullContent); err != nil {
+		return article, err
+	}
+	article.Content = fullContent
+	return article, nil
+}
+
+func previewContent(title, link, fallback string) string {
 	fallback = strings.TrimSpace(fallback)
 	if fallback != "" {
 		return fallback
 	}
 	return fmt.Sprintf("# %s\n\n[%s](%s)", title, link, link)
+}
+
+func isFullArticleContent(content string) bool {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return false
+	}
+	if strings.HasPrefix(content, "# ") {
+		return true
+	}
+	return len(content) > 1500
 }
 
 func (s *Service) fetchArticleContent(ctx context.Context, articleURL string) (string, error) {
