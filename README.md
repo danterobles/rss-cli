@@ -2,6 +2,8 @@
 
 Lector RSS para terminal escrito en Go, con interfaz TUI basada en Bubble Tea y persistencia local en SQLite.
 
+Incluye lectura en terminal, sincronizacion de feeds y extraccion del contenido completo del articulo al abrirlo.
+
 ## Stack
 
 - Go
@@ -62,6 +64,10 @@ Sincronizar todos los feeds registrados:
 ./rss-cli sync
 ```
 
+## Arranque
+
+Al iniciar el programa se muestra un splash screen ASCII con `RSS-CLI` antes de entrar al TUI principal.
+
 ## Datos locales
 
 La base de datos se guarda en:
@@ -81,6 +87,10 @@ Si `XDG_CONFIG_HOME` esta definido, se usa esa ruta base.
 - `a`: agregar un feed
 - `d`: eliminar el feed o articulo seleccionado segun el foco actual
 - `r`: sincronizar el feed seleccionado
+- `u` / `Ctrl+u`: media pagina arriba en lectura
+- `d` / `Ctrl+d`: media pagina abajo en lectura
+- `g`: inicio del articulo
+- `G`: final del articulo
 - `q` o `Ctrl+C`: salir
 
 ## Flujo basico
@@ -89,7 +99,8 @@ Si `XDG_CONFIG_HOME` esta definido, se usa esa ruta base.
 2. Ejecuta `./rss-cli` para abrir la interfaz.
 3. Selecciona un feed en el panel izquierdo.
 4. Abre articulos con `Enter`.
-5. Sincroniza el feed actual con `r`.
+5. Al abrir un articulo, `rss-cli` intenta descargar el HTML del link original para mostrar el contenido completo.
+6. Sincroniza el feed actual con `r`.
 
 ## Desarrollo
 
@@ -112,7 +123,9 @@ Implementado:
 - alta y baja de feeds
 - sincronizacion de feeds
 - listado de feeds y articulos
+- splash screen de arranque
 - lectura de articulos en pantalla completa
+- extraccion del contenido completo del articulo al abrirlo
 - borrado individual de articulos desde la TUI
 - manejo basico de errores en overlays dentro de la TUI
 
